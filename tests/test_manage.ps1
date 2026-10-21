@@ -16,8 +16,8 @@ function New-ScheduledTaskAction {
 function New-ScheduledTaskTrigger {
     param([switch]$AtStartup,[switch]$AtLogOn,$User,[switch]$Once,$At,$RepetitionInterval)
     $class = if ($AtStartup) {'MSFT_TaskBootTrigger'} elseif ($AtLogOn) {'MSFT_TaskLogonTrigger'} else {'MSFT_TaskTimeTrigger'}
-    if ($Once -and $RepetitionInterval.TotalMinutes -ne 1) { throw 'Incorrect repetition.' }
-    return [pscustomobject]@{Delay='';CimClass=@{CimClassName=$class};Repetition=@{Interval=$(if ($Once) {'PT1M'} else {''})}}
+    if ($Once -and $RepetitionInterval.TotalMinutes -ne 2) { throw 'Incorrect repetition.' }
+    return [pscustomobject]@{Delay='';CimClass=@{CimClassName=$class};Repetition=@{Interval=$(if ($Once) {'PT2M'} else {''})}}
 }
 function New-ScheduledTaskPrincipal {
     param($UserId,$LogonType,$RunLevel)

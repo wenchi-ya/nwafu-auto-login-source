@@ -81,7 +81,6 @@ def configure():
     encrypted = protect(json.dumps({"username": user, "password": password}).encode("utf-8"))
     (DATA / "credentials.bin").write_bytes(encrypted)
     write_json("config.json", {"network_name": network})
-    write_json("state.json", {"failures": 0, "next_attempt": 0, "paused": False})
     print("配置已保存。")
 
 
@@ -119,7 +118,11 @@ def probe():
 def login(credentials, visible=False):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="msedge", headless=not visible)
+        # Only this temporary browser bypasses system/PAC proxies. TUN routing
+        # and DNS interception remain controlled by the OS and VPN client.
+        browser = p.chromium.launch(
+            channel="msedge", headless=not visible, args=["--no-proxy-server"]
+        )
         try:
             ctx = browser.new_context(ignore_https_errors=False)
             # Keep credential-bearing requests restricted to the confirmed HTTPS portal.
@@ -166,29 +169,15 @@ def login(credentials, visible=False):
 
 def run(force=False, visible=False):
     config = json.loads((DATA / "config.json").read_text(encoding="utf-8"))
-    state_path = DATA / "state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     online, captive = probe()
     if online:
         logging.info("网络正常，无需认证。")
         return 0
     if not force:
-        if state.get("paused"):
-            logging.info("自动认证已暂停，请重新配置账号密码。")
-            return 1
-        if time.time() < state.get("next_attempt", 0):
-            logging.info("等待重试间隔。")
-            return 0
         network = config.get("network_name")
         if not captive and not (network and network in profiles()):
             logging.info("未识别到校园网络，跳过认证。")
             return 0
-    # Save a cooldown before attempting, including when the browser exits unexpectedly.
-    failures = state.get("failures", 0) + 1
-    state.update(failures=failures, next_attempt=time.time() + min(3600, 300 * 2 ** min(failures - 1, 4)))
-    if failures >= 5:
-        state["paused"] = True
-    write_json("state.json", state)
     credentials = json.loads(protect((DATA / "credentials.bin").read_bytes(), decrypt=True))
     try:
         result = login(credentials, visible)
@@ -196,15 +185,12 @@ def run(force=False, visible=False):
         logging.error("认证未完成（%s）。请检查 Edge、门户证书或页面结构；可运行可视测试。", type(e).__name__)
         return 1
     if result == "success":
-        write_json("state.json", {"failures": 0, "next_attempt": 0, "paused": False})
         logging.info("认证成功，网络已恢复。")
         return 0
-    if result == "bad_credentials" or failures >= 5:
-        state["paused"] = True
-        logging.error("账号密码提示异常或已连续失败 5 次，暂停自动认证。请检查后重新配置。")
+    if result == "bad_credentials":
+        logging.error("账号密码提示异常，请检查配置；下次定时检查仍会尝试认证。")
     else:
-        logging.warning("未确认网络恢复，稍后重试。")
-    write_json("state.json", state)
+        logging.warning("未确认网络恢复，下次定时检查重试。")
     return 1
 
 
@@ -232,7 +218,7 @@ def acquire_lock(lock, wait_seconds=0):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--configure", action="store_true")
-    parser.add_argument("--login", action="store_true", help="Explicitly attempt portal login when offline, ignoring network/cooldown gates")
+    parser.add_argument("--login", action="store_true", help="Explicitly attempt portal login when offline, ignoring network detection")
     parser.add_argument("--visible", action="store_true")
     args = parser.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)

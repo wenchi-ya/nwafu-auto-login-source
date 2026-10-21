@@ -39,10 +39,10 @@ function New-CampusTaskDefinition {
     $startup = New-ScheduledTaskTrigger -AtStartup
     $startup.Delay = 'PT30S'
     $logon = New-ScheduledTaskTrigger -AtLogOn -User $Account
-    $minute = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+    $minute = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 2)
     $principal = New-ScheduledTaskPrincipal -UserId $Account -LogonType Password -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 3) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    return New-ScheduledTask -Action $action -Trigger @($startup, $logon, $minute) -Principal $principal -Settings $settings -Description 'NWAFU campus authentication: startup, Windows sign-in and every minute, including before sign-in.'
+    return New-ScheduledTask -Action $action -Trigger @($startup, $logon, $minute) -Principal $principal -Settings $settings -Description 'NWAFU campus authentication: startup, Windows sign-in and every two minutes, including before sign-in.'
 }
 
 function Register-CampusTask {
@@ -55,7 +55,7 @@ function Register-CampusTask {
     } finally { $password = $null }
     $saved = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     $kinds = @($saved.Triggers | ForEach-Object { $_.CimClass.CimClassName })
-    $repeating = @($saved.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT1M' })
+    $repeating = @($saved.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT2M' })
     if ($saved.Principal.LogonType -ne 'Password' -or
         $kinds -notcontains 'MSFT_TaskBootTrigger' -or
         $kinds -notcontains 'MSFT_TaskLogonTrigger' -or $repeating.Count -ne 1) {
@@ -86,8 +86,8 @@ try {
     }
     if ($Mode -eq 'menu') {
         Write-Host 'NWAFU 校园网自动认证'
-        Write-Host '1. 安装/更新：开机 + 登录 + 每分钟自动检查'
-        Write-Host '2. 修改校园网账号密码 / 解除失败暂停'
+        Write-Host '1. 安装/更新：开机 + 登录 + 每两分钟自动检查'
+        Write-Host '2. 修改校园网账号密码'
         Write-Host '3. 查看自动任务状态'
         Write-Host '4. 停用自动任务'
         Write-Host '5. 手动可视测试'
@@ -131,7 +131,7 @@ try {
             if ($enteredAccount.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid) { throw '输入的 Windows 账户必须与当前账户一致。' }
             try { Register-CampusTask -ProjectRoot $Root -Account $account -TaskName $taskName -Credential $credential }
             finally { $credential = $null }
-            Write-Host 'SUCCESS：已统一启用开机、登录和每分钟检查；未登录时也能运行。' -ForegroundColor Green
+            Write-Host 'SUCCESS：已统一启用开机、登录和每两分钟检查；未登录时也能运行。' -ForegroundColor Green
             Write-Host '已请求一次后台检查。任务配置成功不代表真实校园网认证已经成功。'
         }
         'configure' { Invoke-CampusPython $python '--configure' }
@@ -144,11 +144,7 @@ try {
                 Get-ScheduledTaskInfo -TaskName $taskName | Select-Object LastRunTime,LastTaskResult,NextRunTime | Format-List
                 Write-Host 'LogonType 应为 Password，才支持未登录时运行。LastTaskResult=0 表示正常退出，也可能是无需认证或跳过。'
             }
-            $statePath = Join-Path $dataRoot 'state.json'
-            if (Test-Path -LiteralPath $statePath) {
-                $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-                Write-Host ('认证状态：连续失败次数={0}；暂停={1}' -f $state.failures,$state.paused)
-            }
+            Write-Host '认证策略：每两分钟检查，失败后下次检查继续尝试，不累计失败次数或自动暂停。'
         }
         'disable' {
             $task = Get-ScheduledTask | Where-Object { $_.TaskName -eq $taskName -and $_.TaskPath -eq '\' }

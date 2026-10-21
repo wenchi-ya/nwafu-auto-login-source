@@ -1,6 +1,5 @@
 """Offline Windows regression tests; no real credentials or login requests."""
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -25,7 +24,6 @@ class CampusTests(unittest.TestCase):
         self.data_patch.start()
         self.addCleanup(self.data_patch.stop)
         campus.write_json("config.json", {"network_name": "TEST-CAMPUS"})
-        campus.write_json("state.json", {"failures": 0, "paused": False, "next_attempt": 0})
         self.secret = b'{"username":"test-only","password":"not-a-real-password"}'
         (self.data / "credentials.bin").write_bytes(campus.protect(self.secret))
 
@@ -55,29 +53,36 @@ class CampusTests(unittest.TestCase):
             self.assertEqual(campus.run(), 0)
             login.assert_called_once()
 
-    def test_failure_cooldown(self):
+    def test_failures_do_not_delay_or_pause_later_checks(self):
         with patch.object(campus, "probe", return_value=(False, True)), patch.object(campus, "login", return_value="failed") as login:
-            self.assertEqual(campus.run(), 1)
-            self.assertEqual(campus.run(), 0)
-            login.assert_called_once()
+            for _ in range(6):
+                self.assertEqual(campus.run(), 1)
+            self.assertEqual(login.call_count, 6)
 
-    def test_bad_password_pauses(self):
+    def test_bad_password_does_not_pause_later_checks(self):
         with patch.object(campus, "probe", return_value=(False, True)), patch.object(campus, "login", return_value="bad_credentials") as login:
             self.assertEqual(campus.run(), 1)
             self.assertEqual(campus.run(), 1)
-            login.assert_called_once()
+            self.assertEqual(login.call_count, 2)
 
-    def test_five_exceptions_pause_and_manual_success_recovers(self):
-        campus.write_json("state.json", {"failures": 4, "next_attempt": 0})
+    def test_exceptions_do_not_pause_and_automatic_success_recovers(self):
         with patch.object(campus, "probe", return_value=(False, True)), patch.object(campus, "login", side_effect=RuntimeError("mock")) as login:
-            self.assertEqual(campus.run(), 1)
-            self.assertEqual(campus.run(), 1)
-            login.assert_called_once()
+            for _ in range(6):
+                self.assertEqual(campus.run(), 1)
+            self.assertEqual(login.call_count, 6)
         with patch.object(campus, "probe", return_value=(False, True)), patch.object(campus, "login", return_value="success"):
-            self.assertEqual(campus.run(force=True), 0)
-        state = json.loads((self.data / "state.json").read_text())
-        self.assertFalse(state["paused"])
-        self.assertEqual(state["failures"], 0)
+            self.assertEqual(campus.run(), 0)
+
+    def test_legacy_pause_and_cooldown_are_ignored(self):
+        campus.write_json("state.json", {"failures": 99, "paused": True, "next_attempt": time.time() + 3600})
+        with patch.object(campus, "probe", return_value=(False, True)), patch.object(campus, "login", return_value="success") as login:
+            self.assertEqual(campus.run(), 0)
+            login.assert_called_once()
+        # Even a damaged legacy file must not prevent checks after upgrading.
+        (self.data / "state.json").write_text("invalid json", encoding="utf-8")
+        with patch.object(campus, "probe", return_value=(False, True)), patch.object(campus, "login", return_value="success") as login:
+            self.assertEqual(campus.run(), 0)
+            login.assert_called_once()
 
     def test_cross_process_lock_on_empty_and_existing_file(self):
         code = """
