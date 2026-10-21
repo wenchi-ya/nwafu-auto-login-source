@@ -8,9 +8,12 @@ $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation
 foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }
 
 $script:registered = 0; $script:started = 0; $script:invalidSaved = $false
+$script:testProjectRoot = Join-Path ([System.IO.Path]::GetPathRoot($PSScriptRoot)) 'test space'
 function New-ScheduledTaskAction {
     param($Execute,$Argument,$WorkingDirectory)
-    if ($Execute -ne 'E:\test space\.venv\Scripts\pythonw.exe' -or $Argument -ne '"E:\test space\campus_login.py"') { throw 'Incorrect command quoting.' }
+    $expectedExecute = Join-Path $script:testProjectRoot '.venv\Scripts\pythonw.exe'
+    $expectedArgument = '"' + (Join-Path $script:testProjectRoot 'campus_login.py') + '"'
+    if ($Execute -ne $expectedExecute -or $Argument -ne $expectedArgument -or $WorkingDirectory -ne $script:testProjectRoot) { throw 'Incorrect command quoting or working directory.' }
     return @{}
 }
 function New-ScheduledTaskTrigger {
@@ -47,16 +50,16 @@ function Get-ScheduledTask {
 function Start-ScheduledTask { param($TaskName) $script:started++ }
 
 $credential = [PSCredential]::new('TEST\user', (ConvertTo-SecureString 'mock-not-real' -AsPlainText -Force))
-Register-CampusTask -ProjectRoot 'E:\test space' -Account 'TEST\user' -TaskName 'TEST-only' -Credential $credential
+Register-CampusTask -ProjectRoot $script:testProjectRoot -Account 'TEST\user' -TaskName 'TEST-only' -Credential $credential
 if ($script:registered -ne 1 -or $script:started -ne 1) { throw 'Registration/start did not run.' }
 $script:invalidSaved=$true
 $rejected=$false
-try { Register-CampusTask -ProjectRoot 'E:\test space' -Account 'TEST\user' -TaskName 'TEST-only' -Credential $credential }
+try { Register-CampusTask -ProjectRoot $script:testProjectRoot -Account 'TEST\user' -TaskName 'TEST-only' -Credential $credential }
 catch { $rejected=$true }
 if (-not $rejected -or $script:started -ne 1) { throw 'Invalid saved task should not start.' }
 $empty = [PSCredential]::new('TEST\user', (New-Object Security.SecureString))
 $rejected=$false
-try { Register-CampusTask -ProjectRoot 'E:\test space' -Account 'TEST\user' -TaskName 'TEST-only' -Credential $empty }
+try { Register-CampusTask -ProjectRoot $script:testProjectRoot -Account 'TEST\user' -TaskName 'TEST-only' -Credential $empty }
 catch { $rejected=$true }
 if (-not $rejected -or $script:registered -ne 2) { throw 'Empty password should not register.' }
 Write-Output 'PASS: syntax, three triggers, password logon, limited privileges, quoting, registration, verification failure, empty password (all mocked).'
