@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "campus_login.py"
 spec = importlib.util.spec_from_file_location("campus_login", SOURCE)
@@ -23,6 +23,9 @@ class CampusTests(unittest.TestCase):
         self.data_patch = patch.object(campus, "DATA", self.data)
         self.data_patch.start()
         self.addCleanup(self.data_patch.stop)
+        self.status_patch = patch.object(campus, "portal_status", return_value=None)
+        self.status_patch.start()
+        self.addCleanup(self.status_patch.stop)
         campus.write_json("config.json", {"network_name": "TEST-CAMPUS"})
         self.secret = b'{"username":"test-only","password":"not-a-real-password"}'
         (self.data / "credentials.bin").write_bytes(campus.protect(self.secret))
@@ -42,6 +45,48 @@ class CampusTests(unittest.TestCase):
         with patch.object(campus, "probe", return_value=(True, False)), patch.object(campus, "login") as login:
             self.assertEqual(campus.run(), 0)
             login.assert_not_called()
+
+    def test_portal_offline_overrides_vpn_connectivity(self):
+        with patch.object(campus, "portal_status", return_value=False), patch.object(campus, "probe", return_value=(True, False)), patch.object(campus, "login", return_value="success") as login:
+            self.assertEqual(campus.run(), 0)
+            login.assert_called_once()
+
+    def test_portal_online_avoids_reauthentication_when_internet_unavailable(self):
+        with patch.object(campus, "portal_status", return_value=True), patch.object(campus, "probe", return_value=(False, False)), patch.object(campus, "login") as login:
+            self.assertEqual(campus.run(), 0)
+            login.assert_not_called()
+
+    def test_profile_timeout_does_not_escape_or_submit_on_unknown_network(self):
+        with patch.object(campus, "probe", return_value=(False, False)), patch.object(campus.subprocess, "run", side_effect=subprocess.TimeoutExpired("powershell.exe", 15)), patch.object(campus, "login") as login:
+            self.assertEqual(campus.run(), 0)
+            login.assert_not_called()
+
+    def test_portal_offline_can_login_even_when_profile_lookup_unavailable(self):
+        with patch.object(campus, "portal_status", return_value=False), patch.object(campus, "profiles", side_effect=subprocess.TimeoutExpired("powershell.exe", 15)), patch.object(campus, "login", return_value="success") as login:
+            self.assertEqual(campus.run(), 0)
+            login.assert_called_once()
+
+    def test_browser_login_waits_for_portal_confirmation(self):
+        with patch("playwright.sync_api.sync_playwright") as factory, patch.object(campus.time, "sleep"), patch.object(campus, "portal_status", side_effect=[False, False, False, True]), patch.object(campus, "probe", return_value=(True, False)) as probe:
+            browser = factory.return_value.__enter__.return_value.chromium.launch.return_value
+            page = browser.new_context.return_value.new_page.return_value
+            page.url = campus.PORTAL
+            page.locator.return_value.count.return_value = 1
+            page.locator.return_value.inner_text.return_value = "waiting"
+            self.assertEqual(campus.login({"username": "test-only", "password": "test-only"}), "success")
+            probe.assert_not_called()
+            browser.close.assert_called_once()
+
+    def test_browser_login_does_not_treat_vpn_internet_as_success(self):
+        with patch("playwright.sync_api.sync_playwright") as factory, patch.object(campus.time, "sleep"), patch.object(campus, "portal_status", return_value=False), patch.object(campus, "probe", return_value=(True, False)) as probe:
+            browser = factory.return_value.__enter__.return_value.chromium.launch.return_value
+            page = browser.new_context.return_value.new_page.return_value
+            page.url = campus.PORTAL
+            page.locator.return_value.count.return_value = 1
+            page.locator.return_value.inner_text.return_value = "waiting"
+            self.assertEqual(campus.login({"username": "test-only", "password": "test-only"}), "failed")
+            probe.assert_not_called()
+            browser.close.assert_called_once()
 
     def test_other_network_does_not_login(self):
         with patch.object(campus, "probe", return_value=(False, False)), patch.object(campus, "profiles", return_value=["HOME"]), patch.object(campus, "login") as login:
@@ -109,6 +154,43 @@ with open(sys.argv[2], 'a+b') as f:
             stdout, stderr = waiting.communicate(timeout=15)
             self.assertEqual(waiting.returncode, 0, stderr)
             self.assertEqual(stdout.strip(), "acquired")
+
+
+class PortalStatusTests(unittest.TestCase):
+    def response(self, body, url=campus.STATUS_URL, status=200):
+        response = MagicMock()
+        response.status = status
+        response.geturl.return_value = url
+        response.read.return_value = body
+        response.__enter__.return_value = response
+        opener = MagicMock()
+        opener.open.return_value = response
+        return opener
+
+    def test_authenticated_and_explicitly_offline_jsonp(self):
+        for body, expected in [
+            (b'nwafu_status({"error":"ok"});', True),
+            (b'nwafu_status({"error":"not_online_error"})', False),
+            (b'{"error":"not_online_error"}', False),
+        ]:
+            with self.subTest(body=body), patch.object(campus.urllib.request, "build_opener", return_value=self.response(body)):
+                self.assertIs(campus.portal_status(), expected)
+
+    def test_unknown_or_invalid_response_is_not_offline(self):
+        for body in [b'<html>proxy error</html>', b'{"error":"server_error"}', b'[]', b'other_callback({"error":"ok"})', b'nwafu_status({"error":"ok"}', b'X' * 65537]:
+            with self.subTest(body=body[:50]), patch.object(campus.urllib.request, "build_opener", return_value=self.response(body)):
+                self.assertIsNone(campus.portal_status())
+
+    def test_wrong_origin_or_http_error_is_inconclusive(self):
+        for url, status in [("https://other.example/", 200), (campus.STATUS_URL, 503)]:
+            with self.subTest(url=url, status=status), patch.object(campus.urllib.request, "build_opener", return_value=self.response(b'{"error":"ok"}', url, status)):
+                self.assertIsNone(campus.portal_status())
+
+    def test_timeout_is_inconclusive(self):
+        opener = MagicMock()
+        opener.open.side_effect = TimeoutError()
+        with patch.object(campus.urllib.request, "build_opener", return_value=opener):
+            self.assertIsNone(campus.portal_status())
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import urllib.request
 
 PORTAL = "https://portal.nwafu.edu.cn/srun_portal_pc?ac_id=1&theme=pro"
 HOST = "portal.nwafu.edu.cn"
+STATUS_URL = "https://" + HOST + "/cgi-bin/rad_user_info"
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NWAFUAutoLogin"
 
 
@@ -55,14 +56,22 @@ def write_json(name, value):
 
 
 def profiles():
-    result = subprocess.run([
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "ConvertTo-Json -InputObject @(Get-NetConnectionProfile | Select-Object -ExpandProperty Name) -Compress"
-    ], capture_output=True, timeout=15, creationflags=0x08000000)
-    if result.returncode:
+    try:
+        result = subprocess.run([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+            "ConvertTo-Json -InputObject @(Get-NetConnectionProfile | Select-Object -ExpandProperty Name) -Compress"
+        ], capture_output=True, timeout=15, creationflags=0x08000000)
+        if result.returncode:
+            logging.warning("网络名称查询失败，下次检查重试。")
+            return []
+        names = json.loads(result.stdout.decode("utf-8-sig").strip() or "[]")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("invalid network profile list")
+        return names
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        logging.warning("网络名称查询超时或不可用，下次检查重试；无需重新配置凭据。")
         return []
-    return json.loads(result.stdout.decode("utf-8-sig").strip() or "[]")
 
 
 def configure():
@@ -77,7 +86,7 @@ def configure():
         names = []
     print("当前网络名称：" + ("、".join(names) or "未识别"))
     print("如果当前连接校园网，可填写上面的校园网络名称；不要填写家庭网络或热点名称。")
-    network = input("校园网络名称（回车跳过，仅根据认证跳转判断）：").strip()
+    network = input("校园网络名称（回车跳过，根据门户状态或认证跳转判断）：").strip()
     encrypted = protect(json.dumps({"username": user, "password": password}).encode("utf-8"))
     (DATA / "credentials.bin").write_bytes(encrypted)
     write_json("config.json", {"network_name": network})
@@ -87,6 +96,40 @@ def configure():
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def portal_status():
+    """Read only the fixed HTTPS portal's status; never log its user/session data.
+
+    True = authenticated, False = explicitly offline, None = inconclusive.
+    This is the same JSONP API used by the school's Portal.js.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    url = STATUS_URL + "?callback=nwafu_status&_=" + str(time.time_ns())
+    try:
+        request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+        with opener.open(request, timeout=6) as response:
+            if response.status != 200 or not trusted_url(response.geturl()):
+                return None
+            raw = response.read(65537)
+        if len(raw) > 65536:
+            return None
+        body = raw.decode("utf-8-sig").strip()
+        if body.startswith("nwafu_status("):
+            body = body.removesuffix(";").strip()
+            if not body.endswith(")"):
+                return None
+            body = body[len("nwafu_status("):-1]
+        result = json.loads(body)
+        if not isinstance(result, dict):
+            return None
+        if result.get("error") == "ok":
+            return True
+        if result.get("error") == "not_online_error":
+            return False
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def probe():
@@ -121,19 +164,21 @@ def login(credentials, visible=False):
         # Only this temporary browser bypasses system/PAC proxies. TUN routing
         # and DNS interception remain controlled by the OS and VPN client.
         browser = p.chromium.launch(
-            channel="msedge", headless=not visible, args=["--no-proxy-server"]
+            channel="msedge", headless=not visible, args=["--no-proxy-server"], timeout=20000
         )
         try:
-            ctx = browser.new_context(ignore_https_errors=False)
+            ctx = browser.new_context(ignore_https_errors=False, service_workers="block")
             # Keep credential-bearing requests restricted to the confirmed HTTPS portal.
             ctx.route("**/*", lambda route: route.continue_() if trusted_url(route.request.url) else route.abort())
             page = ctx.new_page()
             page.set_default_timeout(12000)
+            logging.info("认证阶段：直连 Edge 正在打开固定校园门户。")
             page.goto(PORTAL, wait_until="domcontentloaded", timeout=30000)
             if not trusted_url(page.url):
                 raise RuntimeError("unexpected portal origin")
             password = page.locator('input[type="password"]:visible')
             password.first.wait_for(state="visible")
+            logging.info("认证阶段：门户登录框已就绪。")
             username = page.locator(
                 'input#username:visible, input[name="username"]:visible, '
                 'input#user_name:visible, input[name="user_name"]:visible'
@@ -152,12 +197,12 @@ def login(credentials, visible=False):
             if button.count() != 1 or not trusted_url(page.url):
                 raise RuntimeError("ambiguous login button")
             page.on("dialog", lambda dialog: dialog.dismiss())
+            logging.info("认证阶段：提交认证，等待校园门户确认状态。")
             button.click()
             # Never export page text, URLs or screenshots: they may contain credentials.
             for _ in range(4):
                 time.sleep(3)
-                online, _ = probe()
-                if online:
+                if portal_status() is True:
                     return "success"
                 body = page.locator("body").inner_text(timeout=5000)
                 if any(s in body for s in ("密码错误", "密码不正确", "用户名或密码", "账号或密码错误", "E2531", "E2553")):
@@ -168,8 +213,20 @@ def login(credentials, visible=False):
 
 
 def run(force=False, visible=False):
+    logging.info("开始检查（进程 %s，%s）。", os.getpid(), "手动" if force else "自动")
     config = json.loads((DATA / "config.json").read_text(encoding="utf-8"))
-    online, captive = probe()
+    status = portal_status()
+    if status is True:
+        logging.info("校园门户确认当前设备已认证，无需重复登录。")
+        return 0
+    if status is False:
+        # A valid TLS response from the fixed portal is stronger evidence than
+        # public connectivity probes, which may work through a VPN or allowlist.
+        logging.info("校园门户确认当前设备未认证，准备直连认证。")
+        online, captive = False, True
+    else:
+        logging.info("校园认证状态暂不可确认，回退到联网检测和校园网络识别。")
+        online, captive = probe()
     if online:
         logging.info("网络正常，无需认证。")
         return 0
@@ -182,7 +239,7 @@ def run(force=False, visible=False):
     try:
         result = login(credentials, visible)
     except Exception as e:
-        logging.error("认证未完成（%s）。请检查 Edge、门户证书或页面结构；可运行可视测试。", type(e).__name__)
+        logging.error("认证未完成（%s）；下次两分钟检查继续尝试。可检查 VPN、门户访问和 Edge，或运行可视测试。", type(e).__name__)
         return 1
     if result == "success":
         logging.info("认证成功，网络已恢复。")
@@ -244,14 +301,17 @@ def main():
         if sys.stdout is not None:
             handlers.append(logging.StreamHandler(sys.stdout))
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", handlers=handlers)
+        started = time.monotonic()
         try:
             if args.configure:
                 configure()
                 return 0
             return run(args.login, args.visible)
         except Exception as e:
-            logging.error("无法运行（%s）。请先首次配置；需要 Python 3.10+ 和 Microsoft Edge。", type(e).__name__)
+            logging.error("检查未完成（%s）。请检查本机配置文件、权限和运行环境；下次定时检查重试。", type(e).__name__)
             return 1
+        finally:
+            logging.info("本次操作结束（进程 %s，耗时 %.1f 秒）。", os.getpid(), time.monotonic() - started)
 
 
 if __name__ == "__main__":
